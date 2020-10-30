@@ -1,0 +1,427 @@
+---
+title: "Differential Gene Expression"
+author: "Kolja"
+date:
+output: html_document
+---
+
+```{r, load packages}
+
+library(ggplot2)
+library(knitr)
+library(limma)
+library(reshape2)
+library(data.table)
+library(plyr)
+library(dplyr)
+library(ggrepel)
+library(patchwork)
+
+source('./funcs.R')
+
+# plotting options
+colors.tissue = list(macula='#ed7d31', periphery='#5b9bd5')
+
+```
+
+## Load results from filtering and correction
+
+```{r, load data}
+
+# corrected data
+iowa.full = fread('./data/human_retina_DR_combined_normalized_cpm.txt') %>%
+  data.frame %>%
+  tibble::column_to_rownames('ensemblID')
+
+# metdata
+iowa.metadata = fread('./data/TableS1.csv') %>%
+  dplyr::filter(sampleID %in% colnames(iowa.full)) %>%
+  data.frame %>%
+  tibble::column_to_rownames('sampleID')
+
+# id conversion
+df.map = fread('./data/IDconversion.txt')
+
+```
+
+## DE analysis on corrected data
+
+```{r, Contrasts #1 (NonDiabetic, Diabetic, NPDRnoDME, NPDRwDME, PDR)}
+
+# design: Tissue, DiseaseStage, DMEState
+iowa.metadata[, 'DE_groups_1'] = factor(paste0(
+  iowa.metadata$sample_site, '_', 
+  iowa.metadata$disease_group, '_', 
+  iowa.metadata$DME))
+
+# experiment design
+iowa.design_1 = model.matrix(~0 + DE_groups_1, data=iowa.metadata) %>%
+  magrittr::set_colnames(gsub('DE_groups_1', '', colnames(.)))
+
+# define contrasts
+contr.matrix_1 = makeContrasts(
+  Diabetic_M = Macula_Diabetic_FALSE - Macula_NonDiabetic_FALSE,
+  Diabetic_P = Periphery_Diabetic_FALSE - Periphery_NonDiabetic_FALSE,
+  NPDRnoDME_M = Macula_NPDR_FALSE - Macula_NonDiabetic_FALSE,
+  NPDRnoDME_P = Periphery_NPDR_FALSE - Periphery_NonDiabetic_FALSE,
+  NPDRwDME_M = Macula_NPDR_TRUE - Macula_NonDiabetic_FALSE,
+  NPDRwDME_P = Periphery_NPDR_TRUE - Periphery_NonDiabetic_FALSE,
+  PDR_M = Macula_PDR_TRUE - Macula_NonDiabetic_FALSE,
+  PDR_P = Periphery_PDR_TRUE - Periphery_NonDiabetic_FALSE,
+  levels = colnames(iowa.design_1)
+)
+
+# limma
+res.limma_1 = iowa.full %>%
+  lmFit(design=iowa.design_1) %>%
+  contrasts.fit(contrasts=contr.matrix_1) %>%
+  eBayes()
+
+# DE table
+df.DE_1 = lapply(1:ncol(contr.matrix_1), function(x)
+  topTreat(res.limma_1, coef = x, n = Inf, adjust.method = 'BH') %>%
+    tibble::rownames_to_column('ensemblID') %>%
+    mutate(rank = 1:nrow(.))) %>%
+  magrittr::set_names(colnames(contr.matrix_1)) %>%
+  bind_rows(.id='contrast') %>%
+  data.table
+
+```
+
+```{r, Contrasts #2 (NPDR / PDR + DME)}
+
+# column grouping NPDR/PDR + DME samples
+iowa.metadata$disease_group_dme = 
+  ifelse(iowa.metadata$DME, 'DME', iowa.metadata$disease_group)
+
+# design: Tissue, DiseaseStage, DMEState
+iowa.metadata[, 'DE_groups_2'] = factor(paste0(
+  iowa.metadata$sample_site, '_', 
+  iowa.metadata$disease_group_dme))
+
+# experiment design
+iowa.design_2 = model.matrix(~0 + DE_groups_2, data=iowa.metadata) %>%
+  magrittr::set_colnames(gsub('DE_groups_2', '', colnames(.)))
+
+# define contrasts
+contr.matrix_2 = makeContrasts(
+  DME_M = Macula_DME - Macula_NonDiabetic,
+  DME_P = Periphery_DME - Periphery_NonDiabetic,
+  levels = colnames(iowa.design_2)
+)
+
+# limma
+res.limma_2 = iowa.full %>%
+  lmFit(design=iowa.design_2) %>%
+  contrasts.fit(contrasts=contr.matrix_2) %>%
+  eBayes()
+
+# DE table
+df.DE_2 = lapply(1:ncol(contr.matrix_2), function(x)
+  topTreat(res.limma_2, coef = x, n = Inf, adjust.method = 'BH') %>%
+    tibble::rownames_to_column('ensemblID') %>%
+    mutate(rank = 1:nrow(.))) %>%
+  magrittr::set_names(colnames(contr.matrix_2)) %>%
+  bind_rows(.id='contrast') %>%
+  data.table
+
+```
+
+```{r, collect all contrasts}
+
+# combine results and annotate
+DE.full = bind_rows(df.DE_1,  df.DE_2) %>%
+  merge(df.map, by.x='ensemblID', by.y='OriginalName', all.x=T) %>%
+  mutate(fold = ifelse(abs(logFC) <= log2(1.5), 'low', 'high')) %>%
+  mutate(fold = factor(fold, levels=c('low', 'high'))) %>%
+  mutate(direction = ifelse(logFC < 0, 'down', 'up')) %>%
+  mutate(direction = factor(direction, levels=c('up', 'down'))) %>%
+  tidyr::separate(contrast, c('disease_group', 'sample_site'), remove=F) %>%
+  mutate(disease_group = gsub('NPDRnoDME', 'NPDR', disease_group)) %>%
+  mutate(disease_group = gsub('NPDRwDME', 'NPDR + x', disease_group)) %>%
+  mutate(disease_group = gsub('DME', 'NPDR/PDR + DME', disease_group)) %>%
+  mutate(disease_group = gsub('x', 'DME', disease_group)) %>%
+  mutate(disease_group = factor(disease_group, 
+    levels=c('Diabetic', 'NPDR', 'NPDR + DME', 'NPDR/PDR + DME'))) %>%
+  mutate(sample_site = ifelse(sample_site == 'M', 'Macula', 'Periphery')) %>%
+  dplyr::filter(!(contrast %in% c('PDR_M', 'PDR_P'))) %>%
+  mutate(sig = adj.P.Val < 0.05)
+
+# save
+fwrite(DE.full, file='./results/df.features_differential_expression.txt')
+
+```
+
+### signficant expression
+
+```{r, plot with pvalues/fdr per contrast}
+
+# melt and clean
+df.p = DE.full %>%
+  dplyr::select(contrast, P.Value, adj.P.Val) %>%
+  melt(id.vars = 'contrast') %>%
+  mutate(contrast = gsub('_M', ' Macula', contrast)) %>%
+  mutate(contrast = gsub('_P', ' Periphery', contrast)) %>%
+  mutate(contrast = gsub('NPDRnoDME', 'NPDR', contrast)) %>%
+  mutate(contrast = gsub('NPDRwDME', 'NPDR + x', contrast)) %>%
+  mutate(contrast = gsub('DME', 'NPDR/PDR + DME', contrast)) %>%
+  mutate(contrast = gsub('x', 'DME', contrast)) %>%
+  mutate(contrast = factor(contrast, levels = 
+    c('Diabetic Macula', 'NPDR Macula',
+      'NPDR + DME Macula','NPDR/PDR + DME Macula', 
+      'Diabetic Periphery','NPDR Periphery',
+      'NPDR + DME Periphery','NPDR/PDR + DME Periphery'))) %>%
+  mutate(variable = gsub('P.Value', 'p-value', variable)) %>%
+  mutate(variable = gsub('adj.P.Val', 'BH-adjusted p-value', variable)) %>%
+  mutate(variable = factor(variable, levels=c('p-value', 'BH-adjusted p-value'))) %>%
+  data.table
+
+# plot
+p.sig = ggplot(df.p, aes(x=value, fill=variable)) +
+  geom_histogram(alpha=0.7, position='identity', bins=80) +
+  geom_vline(xintercept = 0.05, linetype='dashed') +
+  labs(y='Count') + 
+  facet_wrap(~contrast, ncol = 4) +
+  theme(
+    text = element_text(size=6),
+    legend.key.size = unit(0.5,"line"),
+    legend.title=element_blank(),
+    legend.position = 'top',
+    axis.text.x = element_text(angle=90, hjust=1, vjust=0.4),
+    axis.title.x=element_blank())
+
+# save
+ggsave(p.sig, filename = './figures/fig.pHist.pdf',
+       width=120, height=65, units='mm')
+
+```
+
+```{r, plot DE bar}
+
+# barplot of significant changes
+p.DEbar = ggplot(DE.full[(sig)]) +
+  aes(x=disease_group, fill=direction, alpha=fold) +
+  geom_bar(stat='count') + 
+  scale_fill_manual(name = 'Direction', values=c("#F8766D", "#00BFC4")) +
+  scale_alpha_manual(name = 'Fold Change', values=c(0.5, 1.0)) +
+  scale_x_discrete(drop=FALSE) + 
+  xlab('') +
+  ylab('Differentially\nExpressed Genes') +
+  ylim(0, 1000) +
+  facet_wrap(~sample_site) +
+  theme(axis.text.x = element_text(angle=90, hjust=1, vjust=0.4),
+        text = element_text(size=6),
+        legend.key.size = unit(0.5,"line"),
+        legend.position = 'right') 
+
+# save
+ggsave(plot=p.DEbar, filename='./figures/fig.DEbar.pdf',
+       width=75, height=45, units='mm')
+
+```
+
+```{r, venn diagram DME genes}
+
+# list with late stage genes
+genes.rawID = list(
+  DME.mac=DE.full[contrast == 'DME_M' & (sig), ensemblID],
+  DME.per=DE.full[contrast == 'DME_P' & (sig), ensemblID])
+
+# venn diagram
+p.vennDME = seqsetvis::ssvFeatureVenn(genes.rawID,
+  group_names = c("NPDR/PDR + DME Macula", "NPDR/PDR + DME Periphery"),
+  circle_colors = unlist(colors.tissue),
+  line_width = 0.5,
+  counts_txt_size = 2) +
+  guides(fill=guide_legend(nrow=2,byrow=TRUE)) +
+  theme(
+    legend.position = "right",
+    legend.key.size = unit(0.5,"line"),
+    text = element_text(size=6))
+
+# save
+ggsave(plot=p.vennDME, filename='./figures/fig.DEvenn.pdf',
+       width=65, height=25, units='mm')
+
+```
+
+### clustering
+
+```{r, DME gene expression patterns}
+
+# NOTE: cluster IDs are changed compared to figure in MS
+
+# all late stage genes
+genes.DME = union(genes.rawID$DME.mac, genes.rawID$DME.per)
+
+# pattern analysis
+iowa.metadata$disease_group_dme = 
+  factor(iowa.metadata$disease_group_dme, 
+    levels = c('NonDiabetic', 'Diabetic', 'NPDR', 'DME'))
+iowa.metadata$sample_site = 
+  factor(iowa.metadata$sample_site, 
+    levels = c('Macula', 'Periphery'))
+patterns = DEGreport::degPatterns(
+  iowa.full[genes.DME, rownames(iowa.metadata)],
+  iowa.metadata, time='disease_group_dme', col='sample_site',
+  plot=F)
+
+# plot with labels
+p.patternsDME = patterns$plot + 
+   scale_x_discrete(
+     labels = c('Control','Diabetic', 'NPDR', 'NPDR/PDR + DME')) +
+  scale_color_manual(values = c('#ed7d31', '#5b9bd5')) +
+  theme(legend.position="bottom")
+p.patternsDME$facet$params$ncol = 4
+
+ggsave(plot=p.patternsDME, filename='../635_A_manuscript/figures/figures_sub/fig.DEpatterns.pdf',
+       width=140, height=140, units='mm')
+
+```
+
+### fold changes
+
+```{r, extract fold changes}
+
+# table with fold-changes only
+df.FC = DE.full %>% 
+  reshape::cast(ensemblID~contrast, value='logFC') %>%
+  data.frame %>%
+  tibble::remove_rownames() %>%
+  tibble::column_to_rownames('ensemblID')
+
+```
+
+```{r, correlation of fold changes}
+
+# correlation between fold changes
+df.corFC = df.FC %>%
+  dplyr::select(
+    'Diabetic Macula' = Diabetic_M, 
+    'Diabetic Periphery' = Diabetic_P, 
+    'NPDR + DME Macula' = NPDRnoDME_M, 
+    'NPDR + DME Periphery' = NPDRnoDME_P, 
+    'NPDR/PDR + DME Macula' = DME_M, 
+    'NPDR/PDR + DME Periphery' = DME_P) %>%
+  cor %>%
+  melt
+
+# heatmap
+p.corHeat = ggplot(df.corFC) +
+  aes(x=Var1, y=Var2, fill=value) + 
+  geom_tile() +
+  scale_fill_gradient2(
+    midpoint=0.5, 
+    low="blue", mid="white", high="red", space ="Lab",
+    limits=c(0, 1)) +
+  guides(fill = guide_colourbar(title.position='top', barwidth=7)) +
+  labs(fill='Pearson correlation') +
+  theme(
+    legend.text=element_text(angle=90, vjust=0.4),
+    legend.title = element_text(hjust=0.5),
+    legend.position = 'top',
+    text = element_text(size=6),
+    legend.key.size = unit(0.5,"line"),
+    axis.text.x = element_text(angle=90, hjust=1, vjust=0.4),
+    axis.title=element_blank())
+
+#save
+ggsave(p.corHeat, filename = './figures/fig.corHeat.pdf',
+       width=65, height=80, units='mm')
+
+```
+
+```{r scatter plots to compare fold changes}
+
+# extract fold changes for all groups
+cols.FC = c(
+  "Diabetic_M", "Diabetic_P",
+  "NPDRnoDME_M", "NPDRnoDME_P",
+  "DME_M", "DME_P")
+
+# quick df with correlations between macula and periphery
+df.cor = data.table(
+  group=c('diab', 'npdr', 'dme'),
+  xpos = Inf,
+  ypos = -Inf)
+df.cor[1, 'cor'] = cor(df.FC$Diabetic_M, df.FC$Diabetic_P)
+df.cor[2, 'cor'] = cor(df.FC$NPDRnoDME_M, df.FC$NPDRnoDME_P)
+df.cor[3, 'cor'] = cor(df.FC$DME_M, df.FC$DME_P)
+df.cor$label = paste0('correlation:', round(df.cor$cor, digits=2), '**')
+
+# fold change plots
+p.FC1 = ggplot(df.FC, aes(x=Diabetic_M, y=Diabetic_P)) +
+  geom_point(alpha=0.2) +
+  geom_text(data=df.cor[1], aes(x=xpos, y=ypos + 0.1, label=label),
+            hjust=1.1, vjust=-0.9, size=2.5) +
+  xlab('FC Diabetic Macula') +
+  ylab('FC Diabetic Periphery') +
+  theme(text=element_text(size=8))
+p.FC2 = ggplot(df.FC, aes(x=NPDRnoDME_M, y=NPDRnoDME_P)) +
+  geom_point(alpha=0.2) +
+  geom_text(data=df.cor[2], aes(x=xpos, y=ypos + 0.1, label=label),
+            hjust=1.1, vjust=-0.9, size=2.5) +
+  xlab('FC NPDR Macula') +
+  ylab('FC NPDR Periphery') +
+  theme(text=element_text(size=8))
+p.FC3 = ggplot(df.FC, aes(x=DME_M, y=DME_P)) +
+  geom_point(alpha=0.2) +
+  geom_text(data=df.cor[3], aes(x=xpos, y=ypos + 0.1, label=label),
+            hjust=1.1, vjust=-0.9, size=2.5) +
+  xlab('FC NPDR/PDR + DME Macula') +
+  ylab('FC NPDR/PDR + DME Periphery') +
+  theme(text=element_text(size=8))
+
+# combine and save
+p.FC = p.FC1 + p.FC2 + p.FC3 + plot_layout(nrow=3)
+ggsave(plot=p.FC, filename='./figures/fig.DEscatter.png',
+       width=60, height=180, units='mm')
+
+```
+
+# example genes
+
+```{r, boxplot on individual genes}
+
+library(ggpubr)
+
+# VEGFA and VEGFB
+vegf = c('ENSG00000112715', 'ENSG00000173511')
+p.CPMvegfa = plotCPM(vegf[1])
+p.CPMvegfb = plotCPM(vegf[2]) +
+  theme(
+    legend.position='none',
+    axis.title.y=element_blank())
+p.CPMvegf = p.CPMvegfa + p.CPMvegfb
+
+ggsave(plot=p.CPMvegf, filename='./figures/fig.DEvegf.pdf',
+       width=100, height=70, units='mm')
+
+
+# example DE genes
+genes = c('ENSG00000158859', 'ENSG00000110092', 'ENSG00000155760', 'ENSG00000143248')
+p.CPMdme.list = lapply(genes, function(x) plotCPM(x))
+
+p.CPMdme1 = p.CPMdme.list[[1]] + 
+  theme(
+    legend.position='none',
+    axis.title.x=element_blank())
+p.CPMdme2 = p.CPMdme.list[[2]] + 
+  theme(
+    legend.position='none',
+    axis.title=element_blank())
+p.CPMdme3 = p.CPMdme.list[[3]] + 
+  theme(
+    legend.position='none',
+    axis.title=element_blank())
+p.CPMdme4 = p.CPMdme.list[[4]] + 
+  theme(
+    legend.position='none',
+    axis.title=element_blank())
+p.CPMdme = p.CPMdme1 + p.CPMdme2 + p.CPMdme3 + p.CPMdme4 + plot_layout(ncol=4)
+
+ggsave(plot=p.CPMdme, filename='./figures/fig.DEdme.pdf',
+       width=175, height=60, units='mm')
+
+```
+

@@ -1,0 +1,528 @@
+---
+title: "miRNA / mRNA integration"
+author: "Kolja"
+date:
+output:
+---
+
+```{r setup, include=FALSE}
+
+library(ggplot2)
+library(data.table)
+library(plyr)
+library(dplyr)
+library(cramer)
+library(parallel)
+
+source('./funcs.R')
+
+# plotting options
+colors.tissue = list(macula='#ed7d31', periphery='#5b9bd5')
+
+```
+
+```{r, load data}
+
+# corrected data
+iowa.full = fread('./data/human_retina_DR_totalRNA_normalized_cpm.txt') %>%
+  data.frame %>%
+  tibble::column_to_rownames('ensemblID')
+
+# metdata
+iowa.metadata = fread('./data/TableS1.csv') %>%
+  dplyr::filter(sampleID %in% colnames(iowa.full)) %>%
+  data.frame %>%
+  tibble::column_to_rownames('sampleID')
+
+# id conversion
+df.map = fread('./data/IDconversion.txt')
+
+# load identified mRNA/miRNA in long format
+df.genesDR.long = fread('./results/df.genesDR.long')
+
+```
+
+
+### Are there more or less disease associated miRNA than expected?
+
+
+```{r, miRNA in targets}
+
+# identified mRNA/miRNA to list 
+groups = unique(df.genesDR.long$group)
+genesDR.ensID = lapply(groups, function(x)
+  df.genesDR.long[group == x, ensemblID] %>%
+    unique %>%
+    .[. != '']) %>%
+  magrittr::set_names(groups)
+genesDR.ensID$All = df.genesDR.long$ensemblID %>% unique
+genesDR.ensID$miRNA = df.map[type == 'hsa', OriginalName]
+
+# comparison
+comp.miRNA = compareSets(genesDR.ensID, df.map$OriginalName)
+hyperTable.miRNA = comp.miRNA$setTable %>%
+  filter(Var2 == 'miRNA') %>%
+  mutate(fdr = p.adjust(pVal, method='BH')) %>%
+  mutate(Var1 = gsub('[.]', ' ', Var1)) %>%
+  mutate(Var1 = factor(Var1,
+    levels=c('All', 'DP Macula', 'DP Periphery', 'DE Macula', 'DE Periphery')))
+
+# barplot
+p1 = ggplot(hyperTable.miRNA, aes(x=Var1, y=observed, fill=Var1)) +
+  geom_bar(stat='identity') +
+  scale_fill_manual(
+    values=c('gray', '#ca0020','#f4a582','#0571b0','#92c5de')) +
+  labs(y='# miRNA') +
+  theme(
+    text=element_text(size=6),
+    axis.text.x=element_blank(),
+    axis.title.x=element_blank(),
+    legend.position='none')
+p2 = ggplot(hyperTable.miRNA, aes(x=Var1, y=fold, fill=Var1)) +
+  geom_bar(stat='identity') +
+  geom_text(
+    aes(label=formatC(hyperTable.miRNA$fdr, format='e', digits=0)),
+    y=0.5, angle=90, color='white', size=1.8) +
+  scale_fill_manual(
+    values=c('gray', '#ca0020','#f4a582','#0571b0','#92c5de')) +
+  labs(y='Fold-enrichment') +
+  theme(
+    text=element_text(size=6),
+    axis.text.x=element_text(angle=90, vjust=0.5, hjust=1),
+    axis.title.x=element_blank(),
+    legend.position='none')
+
+# assemble & plot
+p.miRNA = p1 + p2 + plot_layout(ncol=1)
+ggsave(plot=p.miRNA, filename='./figures/fig.miRNA.BarGroups.pdf',
+       width=45, height=75, units='mm')
+
+```
+
+```{r, cpm plots of score4 miRNA}
+
+# select miRNA to plot
+miRNA.show = df.genesDR.long %>%
+  dplyr::filter(score == 4) %>%
+  dplyr::filter(type == 'hsa') %>%
+  .$ensemblID %>%
+  unique
+
+# plot CPM
+score4.list = lapply(miRNA.show, function(x) plotCPM(x))
+
+# adjust
+p.legend = get_legend(score4.list[[1]])
+p1 = score4.list[[1]] + theme(legend.position='none')
+p2 = score4.list[[2]] + theme(legend.position='none', axis.title.y=element_blank())
+p3 = score4.list[[3]] + theme(legend.position='none', axis.title.y=element_blank())
+p4 = score4.list[[4]] + theme(legend.position='none', axis.title.y=element_blank())
+
+# assemble
+p.cpmMIRNA = 
+  (p1 | p2 | p3 | p4) /
+  p.legend +
+  plot_layout(ncol=1, heights=c(0.9, 0.1))
+
+# save
+ggsave(plot=p.cpmMIRNA, 
+       filename='./figures/fig.miRNA.CPM.pdf',
+       width=150, height=70, units='mm')
+
+```
+
+<br>
+
+### Do targets of differentially expressed miRNA show an enrichment among differentially expressed genes?
+
+```{r, mirtar database}
+
+# load mirtar database
+df.mirtar = fread('./data/hsa_MTI_20190729.txt') %>%
+  # map target gene to ensemblID 
+  mutate(ensemblID = df.map[match(.$`Target Gene`, geneID), ensemblID]) %>%
+  # create interaction ID
+  mutate(interactionID = paste0(miRNA, '_', ensemblID)) %>%
+  # filter only expressed miRNA / mRNA
+  filter(miRNA %in% df.map[type == 'hsa']$OriginalName) %>%
+  filter(ensemblID %in% df.map[type == 'ENS']$OriginalName) %>%
+  # remove duplicated entries for interactions (keep only one entry)
+  filter(!duplicated(interactionID)) %>%
+  data.table
+
+```
+
+```{r, comparison differentially expressed miRNA and targets, fig.height=4}
+
+# differentially expressed mRNA
+mRNA.DE = df.genesDR.long[analysis == 'DE' & type == 'ENS', ensemblID] %>% unique
+
+# differentially expressed miRNA
+miRNA.DE = df.genesDR.long[analysis == 'DE' & type == 'hsa', ensemblID] %>% unique
+
+# get targets of diffexpressed miRNA
+miRNA.DE.targets = unique(df.mirtar[miRNA %in% miRNA.DE, ensemblID])
+miRNA.DE.targets = miRNA.DE.targets[!is.na(miRNA.DE.targets)]
+
+# hypergeometric test for enrichment
+obs = length(intersect(mRNA.DE, miRNA.DE.targets))
+exp = length(mRNA.DE) / nrow(df.map[type == 'ENS']) * length(miRNA.DE.targets)
+fc = obs / exp
+p = phyper(
+  length(intersect(mRNA.DE, miRNA.DE.targets)) - 1, 
+  length(mRNA.DE), 
+  nrow(df.map[type == 'ENS']) - length(mRNA.DE), 
+  length(miRNA.DE.targets), 
+  lower.tail = F)
+
+# plot venn for miRNA targets
+seqsetvis::ssvFeatureVenn(
+  list(targets=miRNA.DE.targets, mRNA=mRNA.DE),
+  group_names = c("Known target genes of\ndifferentially regulated miRNA", 
+                  "Differentially expressed mRNA"),
+  line_width = 0.5) +
+  theme(legend.position = "bottom") +
+    guides(fill=guide_legend(nrow=2, byrow=TRUE))
+
+```
+
+
+### Which miRNA show enrichment of targets in DR associated genes?
+
+
+```{r, miRNA target set enrichment}
+
+# list of identified mRNA
+groups = unique(df.genesDR.long$group)
+genesDR = lapply(groups, function(x)
+  df.genesDR.long[type == 'ENS'][group == x, ensemblID] %>%
+    unique %>%
+    .[. != '']) %>%
+  magrittr::set_names(groups)
+
+# list of miRNA target genes
+miRNAs = unique(df.mirtar$miRNA)
+sets.mirtar = lapply(miRNAs, function(x)
+  df.mirtar[miRNA == x, ensemblID])
+names(sets.mirtar) = miRNAs
+
+# gene set enrichment
+comp2 = compareSets(c(genesDR, sets.mirtar), df.map[type == 'ENS', ensemblID])
+
+# subset and correct again
+setTable2 = comp2$setTable %>%
+  filter(Var1 %in% names(genesDR)) %>%
+  filter(Var2 %in% names(sets.mirtar)) %>%
+  mutate(fdr = p.adjust(pVal, method='BH')) %>%
+  mutate(sig = fdr < 0.05) %>%
+  data.table
+
+```
+
+Plot comparing target enrichment fdr values for each of the significant miRNA across the different groups:
+
+
+```{r, barplot each miRNA}
+
+# miRNA with significant target enrichment
+miRNA.sig = as.character(unique(
+  setTable2[fdr < 0.05 & Var1 != 'all', Var2]))
+
+# data frame for plotting
+df.plot = setTable2 %>%
+  filter(Var2 %in% miRNA.sig) %>%
+  mutate(Var1 = gsub('[.]', ' ', Var1)) %>%
+  mutate(Var1 = factor(Var1, 
+    levels=c('DP Macula', 'DP Periphery', 'DE Macula', 'DE Periphery')))
+
+# ordering of miRNA
+order.miRNA = df.plot %>%
+  dplyr::filter(Var1 %in% c('DE Macula', 'DE Periphery')) %>%
+  group_by(Var2) %>%
+  summarize(score = sum(-log10(fdr))) %>%
+  arrange(-score) %>%
+  .$Var2
+df.plot$Var2 = factor(df.plot$Var2 , levels=order.miRNA)
+
+# plot
+p1 = ggplot(df.plot, aes(x=Var2, y=-log10(fdr), fill=Var1)) +
+  geom_bar(stat='identity', width=0.8, position=position_dodge(width = 0.8)) +
+  geom_hline(yintercept=-log10(0.05), linetype='dashed') +
+  labs(y='BH-adjusted p-value\n[-log10]') +
+  guides(fill = guide_legend(ncol=2)) +
+  scale_fill_manual(values=c('#ca0020','#f4a582','#0571b0','#92c5de')) +
+  scale_y_continuous(expand = c(0, 0)) +
+  coord_flip() +
+  theme(
+    text=element_text(size=6),
+    axis.title.y=element_blank(),
+    axis.text.y=element_blank(),
+    #axis.title.x=element_text(vjust=20),
+    legend.position='top',
+    legend.justification='left',
+    legend.key.size = unit(0.5,"line"),
+    legend.title=element_blank())
+p2 = get_legend(p1)
+p1 = p1 + theme(legend.position='none')
+p.bar.miRNA = plot_grid(
+  plot_grid(NULL, p2, ncol=2, rel_widths=c(0.3, 0.7))
+  , p1, nrow=2, rel_heights=c(0.05, 0.95))
+p.bar.miRNA
+
+```
+
+```{r, disease association of selected miRNA}
+
+# plot disease association group of selected miRNA
+test = df.genesDR.long %>%
+  dplyr::filter(ensemblID %in% miRNA.sig) %>%
+  mutate(ensemblID = factor(ensemblID, levels=order.miRNA)) %>%
+  mutate(group = gsub('[.]', ' ', group)) %>%
+  mutate(group = factor(group, 
+    levels=c('DP Macula', 'DP Periphery', 'DE Macula', 'DE Periphery')))
+
+p.groups = ggplot(test) +
+  aes(x=group, y=ensemblID, color=group) +
+  geom_point(size=0.5) +
+  scale_y_discrete(drop=F) +
+  scale_color_manual(values = c('#ca0020', '#f4a582', '#0571b0', '#92c5de')) +
+  theme(
+    legend.position='none',
+    axis.text.x=element_text(angle=90, vjust=0.5, hjust=1),
+    axis.title=element_blank(),
+    text=element_text(size=6),
+    axis.ticks=element_blank())
+
+```
+
+### Identification of miRNA-target associations
+
+```{r, mRNA/miRNA correlation}
+
+# macula and periphery rows for separate correlations
+list.samples = list()
+list.samples$Macula = 
+  rownames(iowa.metadata[iowa.metadata$sample_site == 'Macula', ])
+list.samples$Periphery = 
+  rownames(iowa.metadata[iowa.metadata$sample_site == 'Periphery', ])
+
+# correlation 
+df.cor = lapply(list.samples, function(x)
+  iowa.full[x] %>%
+    t %>%
+    cor(method='spearman') %>%
+    data.frame %>%
+    dplyr::select(df.map[type == 'ENS', OriginalName]) %>%
+    tibble::rownames_to_column('miRNA') %>%
+    dplyr::filter(miRNA %in% df.map[type == 'hsa', OriginalName]) %>%
+    melt(value.name = 'correlation', variable.name = 'target')) %>%
+  bind_rows(.id = 'sample_site') %>%
+  mutate(target_geneID = df.map[match(target, OriginalName), geneID]) %>%
+  mutate(interactionID = paste0(miRNA, '_', target)) %>%
+  mutate(known = interactionID %in% df.mirtar$interactionID) %>%
+  data.table
+
+# define background set
+set.seed(123456789)
+df.cor = df.cor %>%
+  mutate(bkg = interactionID %in% 
+    sample(.[!(known), interactionID], 100000))
+
+```
+
+### Identification of miRNA-target associations
+
+Using the same approach as above we can identify identify miRNA which show a significant different distribution of correlation values compared to the background distribution.
+
+```{r, kolmogorov smirnof test}
+
+# select miRNA with >= 10 targets
+df.ks.tmp = table(df.mirtar$miRNA) %>% 
+  data.table %>%
+  rename(miRNA = V1, n.targets = N) %>%
+  filter(n.targets >= 10) %>%
+  data.table
+
+# test correlations against background
+df.ks = lapply(c('Macula', 'Periphery'), function(s)
+  sapply(df.ks.tmp$miRNA, function(m){
+    ks.test(
+      df.cor[sample_site == s][(known)][miRNA == m]$correlation, 
+      df.cor[(bkg)]$correlation,
+      alternative = 'greater') %>%
+      .$p.value}) %>%
+    data.table %>%
+    magrittr::set_names('ks.p') %>%
+    mutate(miRNA = df.ks.tmp$miRNA) %>%
+    mutate(fdr = p.adjust(ks.p, method="BH")) %>%
+    mutate(sample_site = s)
+  ) %>%
+  bind_rows %>%
+  merge(df.ks.tmp, by='miRNA')
+
+```
+
+```{r, scatterplot and pie chart with result}
+
+# summary dataframe pie chart
+df.ks.plot = df.ks %>%
+  reshape::cast(miRNA~sample_site, value='fdr') %>%
+  mutate(sig.mac = Macula < 0.05) %>%
+  mutate(sig.per = Periphery < 0.05) %>%
+  mutate(group = ifelse(sig.mac, 'Macula', NA)) %>%
+  mutate(group = ifelse(sig.per, 'Periphery', group)) %>%
+  mutate(group = ifelse(sig.mac & sig.per, 'Both', group)) %>%
+  mutate(group = ifelse(is.na(group), 'None', group)) %>%
+  mutate(group = factor(group, levels = c('Both', 'Macula', 'Periphery', 'None'))) %>%
+  data.table
+
+# scatter plot of adjusted p-values
+miRNAks = ggplot(df.ks.plot, aes(x=Macula, y=Periphery, color=group)) +
+  geom_hline(yintercept=0.05, linetype='dashed') +
+  geom_vline(xintercept=0.05, linetype='dashed') +
+  scale_color_manual(values = c('Red', '#ed7d31', '#5b9bd5', 'Grey')) +
+  labs(y='BH-adjusted p-value\nPeriphery', x='BH-adjusted p-value\nMacula') +
+  geom_point(size=0.5) +
+  xlim(0, 1) +
+  ylim(0, 1) +
+  theme(
+    text=element_text(size=6),
+    legend.position='none')
+
+# pie chart with groups
+plot.pie = ggplot(df.pie, aes(x=factor(1), fill=group)) +
+  geom_bar(stat='count') +
+  scale_fill_manual(values = c('Red', '#ed7d31', '#5b9bd5', 'Grey')) +
+  coord_polar("y") +
+  theme(
+    text=element_text(size=6),
+    panel.background = element_blank(),
+    legend.title = element_blank(),
+    legend.key.size = unit(0.5,"line"),
+    legend.position = 'left',
+    axis.text = element_blank(),
+    axis.ticks = element_blank(),
+    axis.title = element_blank())
+
+# assemble
+p.ks = miRNAks + plot.pie +
+  plot_layout(ncol = 2, widths = c(0.8, 0.5))
+
+# save
+ggsave(p.ks, 
+       filename = './figures/fig.ksTest.pdf',
+       width=90, height=45, units='mm')
+
+```
+
+```{r, barplot with KS fdr values for each miRNA with significant enrichment}
+
+# bar plot with log10 fdr
+p.ks = df.ks %>%
+  filter(miRNA %in% order.miRNA) %>%
+  mutate(miRNA = factor(miRNA, levels = order.miRNA)) %>%
+  ggplot(aes(x=miRNA, y=-log10(fdr), fill=sample_site)) +
+    geom_bar(stat='identity', width=0.8, position=position_dodge(width = 0.8)) +
+    geom_hline(yintercept=-log10(0.05), linetype='dashed') +
+    labs(y='BH-adjusted p-value\n[-log10]') +
+    guides(fill = guide_legend(ncol=1, )) +
+    scale_fill_manual(values=c('#ed7d31', '#5b9bd5')) +
+    coord_flip() +
+    scale_y_continuous(expand = c(0, 0)) +
+    theme(
+      text=element_text(size=6),
+      axis.title.y=element_blank(),
+      axis.text.y=element_blank(),
+      axis.title.x=element_text(vjust=20),
+      legend.position='top',
+      legend.justification='right',
+      legend.key.size = unit(0.5,"line"),
+      legend.title=element_blank())
+
+# modifications
+p.ks.legend = get_legend(p.ks)
+p.ks = p.ks + theme(legend.position='none')
+
+# assemble plot
+p.miRNA.integrated = 
+  plot_spacer() + ggplotify::as.ggplot(p2) + p.ks.legend + 
+  p.groups + p1 + p.ks +
+  plot_layout(ncol=3, heights=c(0.1, 0.9), widths=c(0.4, 0.9, 0.9))
+
+# save
+ggsave(
+  plot=p.miRNA.integrated,
+  filename='./figures/fig.miRNA.integrated.pdf',
+  width=90, height=75, units='mm')
+
+```
+
+
+```{r, plot distribution of example genes}
+
+# select example miRNA
+example.miRNA = 'hsa-miR-30a-5p'
+
+# correlation table in known interatcion for example miRNA
+df.cor.example = df.cor %>%
+  dplyr::filter(miRNA %in% example.miRNA & known == TRUE) %>%
+  reshape::cast(interactionID~sample_site, value='correlation') %>%
+  data.table
+
+# correlation table background (takes time)
+df.cor.bkg = df.cor %>%
+  dplyr::filter(bkg = TRUE) %>%
+  reshape::cast(interactionID~sample_site, value='correlation') %>%
+  data.table
+
+# scatter correlations
+plotMiddle = ggplot(df.cor.example) +
+  aes(x=Macula, y=Periphery) + 
+  geom_point(color='brown2', size=0.1) +
+  xlim(-1, 1) +
+  ylim(-1, 1) +
+  xlab('Spearman correlation\nmacula') +
+  ylab('Spearman correlation\nperiphery') +
+  theme(
+    axis.text = element_blank(),
+    text=element_text(size=6))
+plotMiddle.legend = get_legend(plotMiddle)
+plotMiddle = plotMiddle + theme(legend.position='none')
+
+# density plots
+plotTop = ggplot(df.cor.example) +
+  aes(x=Macula) +
+  geom_density(fill=colors.tissue$macula, alpha=0.5) + 
+  geom_density(data = df.cor.bkg, 
+    aes(x=Macula), alpha = 0.0, linetype = 'dashed') +
+  scale_x_continuous(position = "bottom", limits = c(-1, 1)) +
+  ylab('Density') +
+  theme(
+    axis.title.x = element_blank(),
+    text=element_text(size=6))
+plotRight = ggplot(df.cor.example) +
+  aes(x=Periphery) +
+  geom_density(fill=colors.tissue$periphery, alpha=0.5) + 
+  geom_density(data = df.cor.bkg, 
+    aes(x=Periphery), alpha = 0.0, linetype = 'dashed') +
+  scale_x_continuous(position = "bottom", limits = c(-1, 1)) +
+  coord_flip() +
+  ylab('Density') +
+  theme(
+    axis.title.y = element_blank(),
+    text=element_text(size=6))
+
+# assemble
+p.miRNAexample = 
+  plotTop + plot_spacer() +
+  plotMiddle + plotRight +
+  plot_layout(ncol=2, heights=c(0.5, 1.0), widths=c(1.0, 0.5))
+
+# save
+ggsave(
+  plot=p.miRNAexample,
+  filename='./figures/fig.miRNA.example.pdf',
+  width=75, height=65, units='mm')
+
+```
+

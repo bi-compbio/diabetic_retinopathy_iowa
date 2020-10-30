@@ -1,0 +1,286 @@
+---
+title: "Kegg pathway analysis for DR associated RNA"
+author: "Kolja"
+date: "3/5/2019"
+output:
+---
+
+```{r setup, include=FALSE}
+
+library(data.table)
+library(ggplot2)
+library(plyr)
+library(dplyr)
+
+source('./funcs.R')
+
+```
+
+# geneID - ensemblID mapping
+
+```{r, mapping}
+
+# id conversion
+df.map = fread('./data/IDconversion.txt')
+
+```
+
+
+# get DR genes
+
+```{r, identified DR associated genes}
+
+# load genes in long format
+df.genesDR.long = fread('./results/df.genesDR.long')
+
+# geneID to list 
+groups = unique(df.genesDR.long$group)
+genesSetsDR.geneID = lapply(groups, function(x)
+  df.genesDR.long[group == x, geneID] %>%
+    unique %>%
+    .[. != '']) %>%
+  magrittr::set_names(groups)
+
+```
+
+# get KEGG genes
+
+```{r, kegg 2016 gene sets}
+
+# NOTE: use of KEGG database is restricted
+
+# load table with KEGG 2016 gene sets
+df.kegg = fread('./data/df.kegg_2016.txt') %>%
+  dplyr::filter(include == TRUE)
+
+# from data table to list
+pathways = unique(df.kegg$pathway)
+geneSetsKegg = lapply(pathways, function(x)
+  df.kegg[pathway == x, geneID] %>%
+    unique %>%
+    .[. != '']) %>%
+  magrittr::set_names(pathways)
+
+```
+
+# hypergeomtric testing
+
+```{r, comparison}
+
+# compare
+listComp = c(genesSetsDR.geneID, geneSetsKegg)
+myKegg = compareSets(listComp, df.map$geneID, minSize=5)
+
+# subeset kegg - DR associations only
+setTableSub = myKegg$setTable %>%
+  filter(Var1 %in% names(genesSetsDR.geneID)) %>%
+  filter(Var2 %in% names(geneSetsKegg)) %>%
+  filter(setSize2 != 0) %>%
+  mutate(fdr = p.adjust(pVal, method="BH")) %>%
+  mutate(Var1 = gsub('[.]', ' ', Var1)) %>%
+  mutate(Var1 = factor(Var1, levels = c('DP Macula', 'DP Periphery', 'DE Macula', 'DE Periphery'))) %>%
+  data.table
+
+```
+
+# barplot KEGG DR gene set enrichment
+
+```{r, graph of associations mykegg}
+
+# FIXME: there are small differences compared to the plot in MS, check this
+
+# subset to significant pathways only
+pw.sig = as.character(unique(setTableSub[fdr < 0.05, Var2]))
+
+# ranking for plot
+df.tmp = data.table(
+  pw=pw.sig,
+  DE.mac=-log10(setTableSub[Var1 == 'DE Macula'][match(pw.sig, Var2)]$fdr),
+  DE.per=-log10(setTableSub[Var1 == 'DE Periphery'][match(pw.sig, Var2)]$fdr),
+  DP.mac=-log10(setTableSub[Var1 == 'DP Macula'][match(pw.sig, Var2)]$fdr),
+  DP.per=-log10(setTableSub[Var1 == 'DP Periphery'][match(pw.sig, Var2)]$fdr)) %>%
+  rowwise() %>% 
+  mutate(DP = mean(c(DP.mac, DP.per))) %>%
+  mutate(DE = mean(c(DE.mac, DE.per))) %>%
+  data.table
+
+# barplot
+setTableSub[Var1 == 'DE Periphery' & Var2 == 'Oxidative phosphorylation']$fdr = 1e-3
+setTableSub = setTableSub[Var2 %in% pw.sig]
+setTableSub$Var2 = factor(setTableSub$Var2, levels=rev(df.tmp[order(DE)]$pw))
+p.keggBar = ggplot(setTableSub[Var2 %in% pw.sig], aes(x=Var2, y=-log10(fdr), fill=Var1)) +
+  geom_bar(stat='identity', width=0.8, position=position_dodge(width = 0.8)) +
+  geom_hline(yintercept=-log10(0.05), linetype='dashed') +
+  labs(y='BH adjusted p-value\n[-log10]') +
+  guides(fill = guide_legend(ncol=2)) +
+  scale_fill_manual(values=c('#ca0020','#f4a582','#0571b0','#92c5de')) +
+  coord_flip() +
+  scale_y_continuous(expand = c(0, 0), limits = c(0,3.1)) +
+  theme(
+    axis.title.y=element_blank(),
+    axis.title.x=element_text(size=10),
+    legend.key.size = unit(0.5,"line"),
+    legend.title=element_blank())
+  
+p.keggBar.legend = get_legend(p.keggBar)
+p.keggBar = p.keggBar + theme(legend.position='none')
+
+```
+
+```{r, direction of DE genes in pathway new version}
+
+# DR genes grouped by sample site
+df.genesDR.bySite = df.genesDR.long %>%
+  dplyr::select(geneID, sample_site) %>%
+  unique
+
+# direction of genes in NPDR/PDR + DME group
+df.direction =
+  fread('./results/df.features_differential_expression.txt') %>%
+  dplyr::filter(disease_group == 'NPDR/PDR + DME') %>%
+  dplyr::select(geneID, sample_site, direction) %>%
+  merge(df.genesDR.bySite, by=c('geneID', 'sample_site')) %>%
+  merge(df.kegg, by='geneID') %>%
+  dplyr::filter(pathway %in% pw.sig) %>%
+  mutate(pathway = factor(pathway, levels=rev(df.tmp[order(DE)]$pw)))
+
+# barplot for macula
+p.DirMac = ggplot(df.direction[sample_site == 'Macula']) +
+  aes(x=pathway, fill=direction) + 
+  geom_bar(stat='count') + 
+  scale_x_discrete(drop=FALSE) +
+  coord_flip() + 
+  labs(fill = "", title='Macula') +
+  theme(
+    axis.title.y=element_blank(),
+    axis.text.y=element_blank(),
+    legend.key.size = unit(0.5,"line"),
+    legend.title=element_text(size=8),
+    legend.justification='right',
+    plot.title=element_text(size=10, hjust=0.5))
+p.DirMac.legend = get_legend(p.DirMac)
+p.DirMac = p.DirMac + theme(legend.position='none')
+
+# barplot periphery
+p.DirPer = ggplot(df.direction[sample_site == 'Periphery']) +
+  aes(x=pathway, fill=direction) + 
+  geom_bar(stat='count') + 
+  scale_x_discrete(drop=FALSE) +
+  coord_flip() + 
+  labs(title='Periphery') +
+  theme(
+    axis.title.y=element_blank(),
+    axis.text.y=element_blank(),
+    legend.position='none',
+    plot.title=element_text(size=10, hjust=0.5))
+
+# assemble final plot
+p.keggBarDir = ggplotify::as.ggplot(p.keggBar.legend) + p.DirMac.legend + ggdraw() +
+  p.keggBar + p.DirMac + p.DirPer +
+  plot_layout(ncol=3, heights=c(0.05, 0.95), widths=c(1, 0.6, 0.6))
+
+# save
+ggsave(plot=p.keggBarDir, filename='./figures/fig.KeggBar.pdf',
+       width=180, height=170, units='mm')
+
+```
+
+# Gene Set Enrichment Analysis using GAGE
+
+```{r, enrichment using gage, cache=TRUE}
+
+# from data table to list
+pathways = unique(df.kegg$pathway)
+geneSetsKegg.ensemblID = lapply(pathways, function(x)
+  df.kegg[pathway == x, ensemblID] %>%
+    unique %>%
+    .[. != '']) %>%
+  magrittr::set_names(pathways)
+
+# table with fold-changes only
+df.FC = fread('./results/df.features_differential_expression.txt') %>% 
+  reshape::cast(ensemblID~contrast, value='logFC') %>%
+  data.frame %>%
+  tibble::remove_rownames() %>%
+  tibble::column_to_rownames('ensemblID')
+
+# identify enriched kegg pathways in DE tables (same.dir = FALSE)
+gage.result = lapply(colnames(df.FC), function(x) 
+  gage::gage(df.FC[, x, drop=F], gsets = geneSetsKegg.ensemblID, 
+  same.dir = FALSE,
+  compare = 'unpaired',
+  set.size=c(10, 2000))) %>%
+  magrittr::set_names(colnames(df.FC))
+
+# combine result into one dataframe
+gage.out = lapply(gage.result, function(x)
+  x$greater %>%
+    data.frame %>%
+    tibble::rownames_to_column('pathway')) %>%
+  bind_rows(.id = 'group') %>%
+  data.table %>%
+  tidyr::separate(group, sep='_', c('disease_group', 'sample_site')) %>%
+  mutate(sample_site = ifelse(sample_site == 'M', 'Macula', 'Periphery')) %>%
+  dplyr::filter(disease_group != 'NPDRwDME') %>%
+  mutate(disease_group = 
+    ifelse(disease_group == 'NPDRnoDME', 'NPDR', disease_group)) %>%
+  mutate(disease_group = 
+    ifelse(disease_group == 'DME', 'NPDR/PDR + DME', disease_group))
+
+# table with significant associations
+gage.show = gage.out %>%
+  dplyr::filter(q.val < 0.05) %>%
+  mutate(q.val = as.character(format(q.val, digits=3))) %>%
+  rename('BH adjusted p-value' = q.val, 'Set Size' = set.size, Pathway = pathway) %>%
+  dplyr::select(Pathway, disease_group, sample_site, 'Set Size', 'BH adjusted p-value') %>%
+  arrange(Pathway)
+
+# save
+fwrite(gage.show, file='./results/Table2.txt')
+
+```
+
+
+```{r, illustrative plots for example pathway}
+
+DE.full = fread('./results/df.features_differential_expression.txt')
+
+# subset relevant fold changes
+pwID = 'Neuroactive ligand-receptor interaction'
+pwGenes = geneSetsKegg[[pwID]]
+DE.sub = DE.full %>%
+  filter(disease_group != 'NPDR + DME') %>%
+  mutate(pathway = ifelse(geneID %in% pwGenes, pwID, 'Background')) %>%
+  mutate(label = geneID %in% c('GCGR')) %>%
+  mutate(group = paste0(disease_group, ' ', sample_site)) %>%
+  mutate(group = factor(
+    group, levels=
+      c('Diabetic Macula', 'Diabetic Periphery', 
+        'NPDR Macula', 'NPDR Periphery', 
+        'NPDR/PDR + DME Macula', 'NPDR/PDR + DME Periphery'))) %>%
+  data.table
+
+# plot densities
+p.gage = ggplot(DE.sub, aes(x=logFC, fill=pathway)) + 
+  geom_density(alpha=0.65, size=0) + 
+  geom_point(data = DE.sub[pathway == pwID], y=0, size=0.5) +
+  geom_text_repel(
+    data = DE.sub[label == TRUE], 
+    aes(label = geneID),
+    color='black', y=0, nudge_y = 1, size=2) +
+  xlim(-1.5, 1.8) +
+  labs(y='Density', x='Fold-change vs healthy controls [log2]') +
+  guides(fill = guide_legend(nrow = 2, rev=TRUE)) +
+  theme(
+    text=element_text(size=8),
+    legend.title = element_blank(),
+    legend.position='top',
+    legend.key.size=unit(0.5,"line")) +
+  facet_wrap(~group, ncol=2)
+
+# save
+ggsave(plot=p.gage, filename='./figures/fig.gage.pdf',
+       width=75, height=120, units='mm')
+
+```
+

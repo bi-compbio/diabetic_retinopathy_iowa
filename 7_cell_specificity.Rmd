@@ -1,0 +1,308 @@
+---
+title: "Cell-specific Expression of Genes Associated with Diabetic Retinopathy - part II DE genes"
+author: "Kolja"
+date: "11/14/2019"
+output:
+  html_document:
+    code_folding: hide
+    df_print: paged
+    highlight: tango
+    theme: flatly
+    toc: yes
+    toc_float: yes
+---
+
+```{r setup, include=FALSE}
+
+library(data.table)
+library(ggplot2)
+library(Seurat)
+library(plyr)
+library(dplyr)
+
+```
+
+# identified genes and gene ID mapping
+
+```{r, load data}
+
+# id conversion
+df.map = fread('./data/IDconversion.txt')
+
+# identified genes
+df.genesDR.long = fread('./results/df.genesDR.long.txt')
+
+```
+
+# single cell data
+
+ - https://www.ncbi.nlm.nih.gov/geo/query/acc.cgi?acc=GSE130636
+ 
+```{r, load single cell data}
+
+# load single cell data from voigt et al
+load('./data/Retina_scRNASeq_Voigt.RData')
+
+# quick access to metadata
+meta = data.table(scObj@meta.data)
+
+```
+
+```{r, dimplot}
+
+# normalize, find features, scale, pca, umap, plot
+scObj = NormalizeData(scObj)
+scObj = FindVariableFeatures(scObj)
+scObj = ScaleData(scObj,)
+scObj = RunPCA(scObj, features = VariableFeatures(object = scObj))
+scObj = RunUMAP(scObj, dims = 1:10)
+dimplot = DimPlot(scObj, reduction='umap', group.by='prior_annotation')
+
+dimplot + 
+  theme(axis.title = element_text(size=10))
+
+```
+
+# cell specific marker genes
+
+```{r, identify marker genes in sc data}
+
+# background: intersect iowa, scData
+bkg = intersect(
+  df.map$ensemblID,
+  rownames(scObj))
+
+# cell annotation
+cellAnno = data.table(
+  cellName = meta$cellName,
+  cellType = meta$prior_annotation)
+
+# identify cell specific marker genes
+cellTypes = unique(cellAnno$cellType)
+df.spec = lapply(cellTypes, function(c){
+  print(c)
+  cells1 = cellAnno[cellType == c, cellName]
+  cells2 = cellAnno[cellType != c, cellName]
+  genes.spec = FindMarkers(
+   scObj, 
+   ident.1 = cells1, ident.2 = cells2, 
+   features = bkg, only.pos = T, test.use='wilcox', assay='RNA')
+  genes.spec = data.table(genes.spec, ensemblID=rownames(genes.spec))
+  }) %>%
+  magrittr::set_names(cellTypes) %>%
+  bind_rows(.id = 'cellType') %>%
+  mutate(cellTypeShort = gsub('_', '\n', cellType)) %>%
+  mutate(cellTypeShort = factor(cellTypeShort)) %>%
+  mutate(geneID = df.map[match(.$ensemblID, ensemblID)]$geneID) %>%
+  add_count(ensemblID) %>%
+  mutate(Unique = n == 1) %>%
+  mutate(Unique = factor(Unique, c(FALSE, TRUE))) %>%
+  filter(p_val_adj < 0.01) %>%
+  data.table
+
+# save
+fwrite(df.spec, file='./results/df.markers.txt')
+
+```
+
+```{r, barplot cell specific markers}
+
+# indicate number of unique genes
+plot.markers = ggplot(df.spec) +
+  aes(x=cellTypeShort, fill=Unique) +
+  geom_bar(stat='count') +
+  theme(
+    legend.key.size = unit(0.5,"line"),
+    text=element_text(size=6),
+    axis.title.x = element_blank(),
+    axis.text.x = element_text(angle=90, hjust=1, vjust=0.5))
+
+# save
+ggsave(plot.markers, filename='./figures/fig.scMarkers.pdf',
+       height=40, width=80, units='mm')
+
+# for analysis filter unique markers only
+df.spec = df.spec[Unique == TRUE]
+
+```
+
+# enrichment DR genes and markers
+
+```{r, enrichment between cell specific markers}
+
+# list of DR genes
+genesDR = list()
+genesDR$DiabeticRetinopathy = df.genesDR.long[type != 'hsa']$ensemblID %>% unique
+
+# list of cell specific genes
+geneSetsSC = lapply(cellTypes, function(c) 
+  df.spec[cellType == c]$ensemblID) %>%
+  magrittr::set_names(cellTypes)
+
+# hypergeometric test between sets of marker genes
+geneSets = c(geneSetsSC, genesDR)
+compMarkers = compareSets(geneSets, bkg)
+
+```
+
+```{r, plot overlap cell specific markers and DR genes, fig.height=7}
+
+# direction of genes in NPDR/PDR + DME group (merge later)
+df.direction =
+  fread('./results/df.features_differential_expression.txt') %>%
+  dplyr::filter(disease_group == 'NPDR/PDR + DME') %>%
+  dplyr::select(ensemblID, sample_site, direction) %>%
+  reshape::cast(ensemblID~sample_site, value='direction') %>%
+  data.table
+
+# add target info to specific genes
+df.spec.plot = df.spec %>%
+  mutate(DRgene = ensemblID %in% df.genesDR.long$ensemblID) %>%
+  mutate(gene.mac = ensemblID %in% df.genesDR.long[sample_site == 'Macula']$ensemblID) %>%
+  mutate(gene.per = ensemblID %in% df.genesDR.long[sample_site == 'Periphery']$ensemblID) %>%
+  merge(df.direction, by='ensemblID') %>%
+  mutate(Macula = factor(Macula, levels = c('up', 'down'))) %>%
+  mutate(Periphery = factor(Periphery, levels = c('up', 'down')))
+
+# get statistics on gene set overlap
+stats.plot = compMarkers$setTable %>%
+  filter(Var1 %in% names(geneSetsSC)) %>%
+  filter(Var2 == 'DiabeticRetinopathy') %>%
+  mutate(fdr = p.adjust(pVal, method='BH')) %>%
+  mutate(prop = observed / setSize1) %>%
+  mutate(Var1 = gsub('_', '\n', Var1)) %>%
+  data.table
+
+# barplot general overlap
+p.scBarAll = ggplot(df.spec.plot) +
+  geom_bar(stat='count', aes(x=cellTypeShort, fill=cellTypeShort, alpha=DRgene)) +
+  geom_text(
+    data=stats.plot, 
+    aes(x=Var1, y=observed + 37, 
+        label=paste0(
+          round(prop, 2), ifelse(fdr < 0.05, '*', ''))), size=1.75, angle=90) +
+  scale_alpha_manual(values = c(0.5, 1)) +
+  ylab('# Cell Specific Marker Genes') +
+  theme(
+    text=element_text(size=6),
+    legend.position = 'none',
+    axis.title.x = element_blank(),
+    axis.text.x = element_blank())
+
+# plot direction of macula genes
+p.scBarMac = ggplot(df.spec.plot[(gene.mac)]) +
+  aes(x=cellTypeShort, fill=Macula) +
+  geom_bar(
+    stat='count', 
+    position=position_dodge(preserve = "single")) +
+  ylab('Macula') +
+  scale_fill_discrete(drop=F) +
+  scale_x_discrete(drop=F) +
+  theme(
+    text=element_text(size=6),
+    legend.position = 'none',
+    axis.title.x = element_blank(),
+    axis.text.x = element_blank())
+
+# plot direction of periphery genes
+p.scBarPer = ggplot(df.spec.plot[(gene.per)]) +
+  aes(x=cellTypeShort, fill=Periphery) +
+  geom_bar(
+    stat='count', 
+    position=position_dodge(preserve = "single")) +
+  ylab('Periphery') +
+  labs(fill = 'Direction') +
+  scale_x_discrete(drop=F) +
+  scale_fill_discrete(drop=F) +
+  theme(
+    text=element_text(size=6),
+    legend.position = 'bottom',
+    legend.key.size = unit(0.5,"line"),
+    axis.title.x = element_blank(),
+    axis.text.x = element_text(angle=90, hjust=1, vjust=0.5))
+
+# get legend entry up/down
+p.scBarLegend = get_legend(p.scBarPer)
+p.scBarPer = p.scBarPer +
+  theme(legend.position = 'none')
+
+# combine plots
+p.scBar = p.scBarAll + p.scBarMac + p.scBarPer + p.scBarLegend +
+  plot_layout(ncol=1, heights = c(1, 0.4, 0.4, 0.1))
+
+# save
+ggsave(
+  plot=p.scBar, filename='./figures/fig.scBar.pdf',
+  width=80, height=100, units='mm')
+
+```
+# cell specific pathways
+
+```{r, kegg 2016 gene sets}
+
+# NOTE: use of KEGG database is restricted
+
+# load table with KEGG 2016 gene sets
+df.kegg = fread('./data/df.kegg_2016.txt') %>%
+  dplyr::filter(include == TRUE)
+
+# from data table to list
+pathways = unique(df.kegg$pathway)
+geneSetsKegg = lapply(pathways, function(x)
+  df.kegg[pathway == x, geneID] %>%
+    unique %>%
+    .[. != '']) %>%
+  magrittr::set_names(pathways)
+
+```
+
+
+```{r, comparison DR genes and kegg}
+
+# list of cell specific DR genes
+geneSetsDRspecific = lapply(cellTypes, function(c)
+  df.spec.plot[DRgene == TRUE & cellType == c, geneID]) %>%
+  magrittr::set_names(cellTypes)
+
+# compare cell specific genes with kegg
+bkg.geneID = df.map[ensemblID %in% bkg]$geneID
+compV2 = compareSets(c(geneSetsKegg, geneSetsDRspecific), bkg.geneID)
+
+```
+
+```{r, heatmap with kegg DR gene associations}
+
+# thresholding for results
+thr = 0.01
+setTableOut = compV2$setTable %>%
+  filter(Var1 %in% names(geneSetsKegg)) %>%
+  filter(Var2 %in% names(geneSetsDRspecific)) %>%
+  mutate(cellTypeShort = gsub('_', ' ',Var2)) %>%
+  mutate(fdr = p.adjust(pVal, method = 'BH')) %>%
+  filter(fdr < thr) %>%
+  data.table
+
+# order to plot
+pw.order = rev(unique(setTableOut[order(cellTypeShort)]$Var1))
+setTableOut = setTableOut %>%
+  mutate(Var1 = factor(Var1, levels=pw.order)) %>%
+  data.table
+
+# dot plot
+p.scKegg = ggplot(setTableOut, aes(x=cellTypeShort, y=Var1, color=-log10(fdr))) +
+  geom_point(size=0.5) +
+  scale_color_gradient2(midpoint=3.5, low="blue", mid="orange", high="red", space ="Lab" ) +
+  labs(color='BH-adjusted p-value\n[-log10]') +
+  guides(color = guide_colourbar(title.position='right', barheight=3.5, barwidth=0.25)) +
+  theme(
+    legend.title=element_text(size=5, angle=90, hjust = 0.5),
+    axis.text.x = element_text(angle=90, hjust=1, vjust=0.5),
+    axis.title = element_blank(),
+    text=element_text(size=6),
+    legend.key.size = unit(0.5,"line"),)
+
+# save
+ggsave(p.scKegg, file='./figures/fig.scKegg.pdf',
+       width=75, height=40, units='mm')
+
+```

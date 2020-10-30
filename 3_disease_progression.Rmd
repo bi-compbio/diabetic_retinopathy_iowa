@@ -1,0 +1,275 @@
+---
+title: "Plot results of disease progression models"
+author: Becker Kolja
+date: 
+output:
+---
+
+NOTE: The respective models are run in stand-alone Rscripts due to computational limitations
+
+### Setup
+
+```{r, setup, include=FALSE}
+
+library(ggplot2)
+library(cowplot)
+library(RColorBrewer)
+library(reshape2)
+library(data.table)
+library(plyr)
+library(dplyr)
+
+# plotting options
+colors.tissue = list(macula='#ed7d31', periphery='#5b9bd5')
+
+```
+
+
+### Model Performance
+
+```{r, get convergence stats}
+
+# NOTE: cost.mac / cost.per are results from fitting the model to respective expression data
+# - what was the cost function?
+# - what was the ranking?
+# --> this code will need to be deposited as well
+
+
+# get parameter samples
+cost.mac = fread('./results/df.cost.mac.csv')
+cost.per = fread('./results/df.cost.per.csv')
+cost.mac$n.iter = 1:nrow(cost.mac)
+cost.per$n.iter = 1:nrow(cost.per)
+cost.mac$Tissue = 'Macula'
+cost.per$Tissue = 'Periphery'
+cost.mac$n.epoch = trunc(cost.mac$n.iter / 100)
+cost.per$n.epoch = trunc(cost.per$n.iter / 100)
+
+# get cost.hat
+cost.mac$cost.hat = sapply(1:nrow(cost.mac), function(x) min(cost.mac[1:x, cost]))
+cost.per$cost.hat = sapply(1:nrow(cost.per), function(x) min(cost.per[1:x, cost]))
+
+# get p hat
+n.best = 0
+for (i in 2:nrow(cost.mac)){
+  if (cost.mac[i]$cost.hat != cost.mac[i - 1]$cost.hat){n.best = i}
+  cost.mac[i, c('d1.hat', 'd2.hat', 'eta.hat', 'K.hat', 'n.hat')] =
+    cost.mac[n.best, c('d1', 'd2', 'eta', 'K', 'n')]}
+n.best = 0
+for (i in 2:nrow(cost.per)){
+  if (cost.per[i]$cost.hat != cost.per[i - 1]$cost.hat){n.best = i}
+  cost.per[i, c('d1.hat', 'd2.hat', 'eta.hat', 'K.hat', 'n.hat')] =
+    cost.per[n.best, c('d1', 'd2', 'eta', 'K', 'n')]}
+
+# merge
+cost = rbind(cost.mac, cost.per)
+
+```
+
+
+```{r, plot convergence}
+
+# d1, d2 plots
+dist.mac = ggplot(
+  melt(cost.mac[, c('n.iter', 'd1.hat', 'd2.hat')], id.vars=c('n.iter')),
+  aes(x=n.iter, y=value, color=variable)) +
+  geom_line() +
+  scale_color_discrete(labels = c(bquote(d[Diabetic]), bquote(d[NPDR]))) +
+  ylim(0, 3) +
+  ylab(bquote(d[Diabetic] / d[NPDR])) +
+  theme(
+    legend.position='bottom',
+    text=element_text(size=6),
+    legend.key.size = unit(0.5,"line"),
+    axis.title.x=element_blank(),
+    legend.title=element_blank())
+dist.legend = get_legend(dist.mac)
+dist.mac = dist.mac + theme(legend.position='none')
+dist.per = ggplot(
+  melt(cost.per[, c('n.iter', 'd1.hat', 'd2.hat')], id.vars=c('n.iter')),
+  aes(x=n.iter, y=value, color=variable)) +
+  geom_line() +
+  ylim(0, 3) +
+  theme(
+    legend.position='none',
+    text=element_text(size=6),
+    axis.title=element_blank())
+
+# n plots
+n.mac = ggplot(cost.mac,
+  aes(x=n.iter, y=n.hat)) +
+  geom_line() +
+  ylim(0, 1350) +
+  labs(y='n', x='function iterations') +
+  theme(
+    legend.key.size = unit(0.5,"line"),
+    text=element_text(size=6))
+n.per = ggplot(cost.per,
+  aes(x=n.iter, y=n.hat)) +
+  geom_line() +
+  ylim(0, 1350) +
+  labs(y='n', x='function iterations') +
+  theme(
+    text=element_text(size=6),
+    legend.key.size = unit(0.5,"line"),
+    axis.title.y=element_blank())
+
+# convergence plots
+conv.mac  = ggplot(cost.mac, aes(x=n.iter, y=cost.hat)) + 
+  geom_line(color=colors.tissue$macula) +
+  labs(y = 'RMSE', title='Macula') +
+  theme(
+    legend.position='bottom',
+    legend.key.size = unit(0.5,"line"),
+    text=element_text(size=6), 
+    axis.title.x=element_blank(),
+    plot.title = element_text(hjust = 0.5, size=6))
+conv.per  = ggplot(cost.per, aes(x=n.iter, y=cost.hat)) + 
+  geom_line(color=colors.tissue$periphery) +
+  labs(y = 'RMSE', title='Periphery') +
+  theme(
+    legend.position='bottom',
+    legend.key.size = unit(0.5,"line"),
+    text=element_text(size=6), 
+    axis.title=element_blank(),
+    plot.title = element_text(hjust = 0.5, size=6))
+
+# assemble multipanel
+p.conv = 
+  conv.mac + conv.per +
+  dist.mac + dist.per +
+  n.mac + n.per +
+  dist.legend + plot_spacer() +
+  plot_layout(ncol=2, heights=c(1,1,1,0.3))
+
+# save
+ggsave(plot=p.conv, filename='./figures/fig.ModelConvergence.pdf',
+       width=70, height=75, units='mm')
+
+```
+
+## Load results from filtering and correction
+
+```{r, load data}
+
+# corrected data
+iowa.full = fread('./data/human_retina_DR_totalRNA_normalized_cpm.txt') %>%
+  data.frame %>%
+  tibble::column_to_rownames('ensemblID')
+
+# metdata
+iowa.metadata = fread('./data/TableS1.csv') %>%
+  dplyr::filter(sampleID %in% colnames(iowa.full)) %>%
+  data.frame %>%
+  tibble::column_to_rownames('sampleID')
+
+# id conversion
+df.map = fread('./data/IDconversion.txt')
+
+```
+
+# get selected features
+
+```{r, selected features}
+
+# NOTE: this table contain beta values from final SPLS models
+df.features =
+  fread('./results/df.features_progression_model.txt')
+
+```
+
+### clustering
+
+```{r, gene expression patterns}
+
+# union of disease progressoin genes
+genes.DP = union(
+  df.features[sample_site == 'Macula']$ensemblID, 
+  df.features[sample_site == 'Periphery']$ensemblID)
+
+# subselect samples for analysis (no PDR + DME)
+list.samples = rownames(iowa.metadata[iowa.metadata$disease_group_detailed != 'PDR + DME', ])
+iowa.metadata.sub = iowa.metadata[list.samples, ]
+
+# pattern analysis
+iowa.metadata.sub$disease_group_detailed = 
+  factor(iowa.metadata.sub$disease_group_detailed)
+iowa.metadata.sub$sample_site = 
+  factor(iowa.metadata.sub$sample_site)
+patterns.DP = DEGreport::degPatterns(
+  iowa.full[genes.DP, list.samples],
+  iowa.metadata.sub, time='disease_group_detailed', col='sample_site',
+  plot=F)
+
+# plot with labels
+patternsDP = patterns.DP$plot
+patternsDP = patternsDP + 
+  #scale_x_discrete(
+  #  labels = c('Control','Diabetic', 'NPDR', 'NPDR + DME')) +
+  scale_color_manual(values = c('#ed7d31', '#5b9bd5')) +
+  theme(legend.position = "bottom")
+patternsDP$facet$params$ncol = 5
+
+ggsave(plot=patternsDP, filename='./figures/fig.patternsDP.pdf',
+       height=150, width=160, units='mm')
+
+```
+
+
+### Boxplots model performance fixed N
+
+```{r, plot model performance for fixed n models}
+
+# NOTE: legacy code - not used in manuscript
+
+library(ggpubr)
+
+# NOTE: these tables contain RMSE values from runs with feature pre-selection
+mat.rmspe.mac = fread(
+  './results/rmspe5x20.filter.mac.csv')
+mat.rmspe.per = fread(
+  './results/rmspe5x20.filter.per.csv')
+mat.rmspe = cbind(mat.rmspe.mac, mat.rmspe.per)
+
+# df for plotting
+df.rmspe = melt(
+  mat.rmspe, variable.name = 'run', value.name = 'RMSPE')
+df.rmspe$Tissue = 
+  sapply(strsplit(as.character(df.rmspe$run), '[.]'), '[', 2)
+df.rmspe$Tissue = gsub('mac', 'Macula', df.rmspe$Tissue)
+df.rmspe$Tissue = gsub('per', 'Periphery', df.rmspe$Tissue)
+df.rmspe$Type = 
+  sapply(strsplit(as.character(df.rmspe$run), '[.]'), '[', 4)
+df.rmspe = rbind(
+  df.rmspe,
+  data.table(run='dummy', RMSPE=NA, Tissue=c('Macula', 'Periphery'), Type=' ')
+)
+df.rmspe$Type = factor(df.rmspe$Type,
+  levels = 
+    c(c('full', 'mRNA', 'miRNA'),
+    seq(100, 1500, 100), 
+    seq(2000, 15000, 1000),
+    ' ', 'optimized'))
+
+df.rmspe = df.rmspe %>%
+  data.table
+
+# subset for now (possibly show more in supplement)
+n.seq = c(seq(100, 1500, 100), seq(2000, 15000, 1000))
+n.show = c(seq(100, 1500, 200), seq(2000, 15000, 1000))
+df.rmspe = df.rmspe[!Type %in% c('full', 'mRNA', 'miRNA', setdiff(n.seq, n.show))]
+
+ggplot(
+  df.rmspe, aes(x=Type, y=RMSPE, group=Type, fill=Tissue)) +
+  geom_boxplot() +
+  grids(linetype = "dashed", axis='y') +
+  scale_fill_manual(values = c('#ed7d31', '#5b9bd5')) +
+  ylim(0.1, 1.4) +
+  theme(
+    axis.text.x = element_text(angle = 90, vjust = 0.4, size=10, hjust=1),
+    axis.title.x = element_blank(),
+    legend.position = 'none',
+    panel.background=element_blank()) +
+  facet_wrap(~Tissue, nrow = 2)
+
+```

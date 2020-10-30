@@ -1,0 +1,218 @@
+---
+title: "Deconvolution IOWA data"
+author: "Kolja"
+date:
+output:
+---
+
+
+```{r setup, include=FALSE}
+
+library(SummarizedExperiment)
+library(data.table)
+library(ggplot2)
+library(MuSiC)
+library(xbioc)
+library(Seurat)
+library(plyr)
+library(dplyr)
+
+```
+
+# bulk expression data
+
+```{r, load data}
+
+# corrected data
+iowa.full = fread('./data/human_retina_DR_totalRNA_normalized_cpm.txt') %>%
+  data.frame %>%
+  tibble::column_to_rownames('ensemblID')
+
+# metdata
+iowa.metadata = fread('./data/TableS1.csv') %>%
+  dplyr::filter(sampleID %in% colnames(iowa.full)) %>%
+  data.frame %>%
+  tibble::column_to_rownames('sampleID')
+
+# to expression set
+bulkExprSet = ExpressionSet(
+  assayData = as.matrix(2 ** iowa.full),
+  phenoData = AnnotatedDataFrame(iowa.metadata))
+
+# id conversion
+df.map = fread('./data/IDconversion.txt')
+
+# identified genes
+df.genesDR.long = fread('./results/df.genesDR.long.txt')
+
+```
+
+# expression changes per cell type based on cell specific markers
+
+```{r, heatmap markers}
+
+# table with marker genes (precomputed from orginal data with fdr < 0.01)
+df.spec = fread('./results/df.markers.txt') %>%
+  dplyr::filter(Unique == TRUE)
+
+# ordering of genes
+levels.genes = df.spec %>% 
+  arrange(cellType) %>% 
+  .$ensemblID
+
+# table with fold changes vs healthy control
+DE.full = fread('./results/df.features_differential_expression.txt') %>%
+  dplyr::filter(disease_group != 'NPDR + DME') %>%
+  merge(df.spec, by='ensemblID') %>%
+  mutate(disease_group = factor(disease_group, 
+    levels=c('Diabetic', 'NPDR', 'NPDR/PDR + DME'))) %>%
+  mutate(logFC = ifelse(logFC < -1, -1, logFC)) %>%
+  mutate(logFC = ifelse(logFC > 1, 1, logFC)) %>%
+  mutate(ensemblID = factor(ensemblID, levels=levels.genes)) %>%
+  data.table
+
+# heatmap mac
+p.markerHeatmap.mac = ggplot(DE.full[sample_site == 'Macula']) +
+  aes(x=disease_group, y=ensemblID, fill=logFC) + 
+  geom_tile() +
+  labs(title='Macula', fill='Fold-Change\n[log2]') +
+  scale_fill_gradient2(low='blue', mid='white', high='red') +
+  theme(
+    text=element_text(size=6),
+    plot.title=element_text(hjust=0.5, size=6),
+    axis.text.y=element_blank(),
+    axis.ticks.y=element_blank(),
+    axis.title=element_blank(),
+    axis.text.x=element_text(angle=90, vjust=0.5, hjust=1),
+    legend.justification='left',
+    legend.key.size=unit(0.5,"line"),
+    legend.title=element_text(size=5))
+p.marker.legend = get_legend(p.markerHeatmap.mac)
+p.markerHeatmap.mac = p.markerHeatmap.mac + theme(legend.position='none')
+
+# heatmap per
+p.markerHeatmap.per = ggplot(DE.full[sample_site == 'Periphery']) +
+  aes(x=disease_group, y=ensemblID, fill=logFC) + 
+  geom_tile() +
+  labs(title='Periphery') +
+  scale_fill_gradient2(low='blue', mid='white', high='red') +
+  theme(
+    text=element_text(size=6),
+    plot.title=element_text(hjust=0.5, size=6),
+    axis.text.y=element_blank(),
+    axis.ticks.y=element_blank(),
+    axis.title=element_blank(),
+    axis.text.x=element_text(angle=90, vjust=0.5, hjust=1),
+    legend.position='none')
+
+# annotation column
+p.markerAnno = ggplot(DE.full) +
+  aes(x=1, y=ensemblID, fill=cellType) + 
+  geom_tile() +
+  theme(
+    text=element_text(size=6),
+    axis.text=element_blank(),
+    axis.ticks=element_blank(),
+    axis.title=element_blank(),
+    legend.justification='left',
+    legend.title=element_blank(),
+    legend.key.size=unit(0.5,"line"))
+p.anno.legend = get_legend(p.markerAnno)
+p.markerAnno = p.markerAnno + theme(legend.position='none')
+
+# assemble
+p.legend = ggplotify::as.ggplot(p.anno.legend) + p.marker.legend + plot_spacer() +
+  plot_layout(ncol=1, heights=c(0.8, 0.3, 0.05))
+p.out = p.markerHeatmap.mac + p.markerAnno + p.markerHeatmap.per +
+  p.legend +
+  plot_layout(widths=c(0.3, 0.05, 0.3, 0.3), ncol=4)
+
+# save
+ggsave(p.out, filename='./figures/fig.scHeat.pdf',
+       height=85, width=100, units='mm')
+
+```
+
+# Deconvolution
+
+
+```{r, prepare single cell data}
+
+# load single cell data
+load('./data/Retina_scRNASeq_Voigt.RData')
+
+# quick access to metadata
+meta = data.table(scObj@meta.data)
+cellTypes = unique(meta$prior_annotation)
+
+# build reference
+n.max = 500
+subSetCells = unlist(lapply(cellTypes, function(ct){
+  n = min(nrow(meta[prior_annotation == ct]), n.max)
+  meta[prior_annotation == ct][sample(.N, n, replace = F)]$cellName}))
+exprMatrix = as.matrix(scObj@assays$RNA@data[, subSetCells])
+scExprSet = ExpressionSet(
+  assayData = exprMatrix,
+  phenoData = AnnotatedDataFrame(scObj@meta.data[subSetCells, ]))
+
+```
+
+
+```{r, deconvolution}
+
+# predict cell type distribution of iowa samples
+predMusic = music_prop(
+  bulk.eset = bulkExprSet, 
+  sc.eset = scExprSet, 
+  clusters = 'prior_annotation', 
+  samples = 'cellName', verbose = T)
+
+```
+
+```{r, individual boxplots}
+
+# combine metadata and cell fractions
+df.fracs = predMusic$Est.prop.weighted %>%
+  data.frame %>%
+  tibble::rownames_to_column('sampleID') %>%
+  melt(variable.name = 'cellType') %>%
+  merge(iowa.metadata %>% tibble::rownames_to_column('sampleID')) %>%
+  mutate(disease_group_detailed = gsub('Non-Diabetic', 'Control', disease_group_detailed)) %>%
+  mutate(disease_group_detailed = factor(disease_group_detailed,
+         levels = c('Control', 'Diabetic', 'NPDR', 'NPDR + DME', 'PDR + DME'))) %>%
+  data.table
+
+# boxplot for each celltype
+list.boxplots = lapply(cellTypes, function(ct)
+  ggplot(df.fracs[cellType == ct]) +
+    aes(x=disease_group_detailed, y=value, fill=sample_site) + 
+    geom_boxplot(outlier.size=0.1) +
+    geom_jitter(height = 0, size=0.1) +
+    scale_fill_manual(values = c('#ed7d31', '#5b9bd5')) + 
+    facet_wrap(~sample_site) +
+    labs(title = ct, y='Estimated Fraction') +
+    theme(
+      text=element_text(size=6),
+      axis.text.x=element_text(angle=90, vjust=0.5, hjust=1),
+      legend.position='none',
+      plot.title=element_text(size=6),
+      axis.title.x=element_blank(),
+      strip.text=element_text(size=6))) %>%
+  magrittr::set_names(cellTypes)
+
+# celltypes to plot in publication
+celltypes.show = names(which(colSums(predMusic$Est.prop.weighted) != 0))
+
+# plot (only subset)
+p.RGC = list.boxplots$RGC
+p.Unknown = list.boxplots$Unknown + theme(axis.title.y=element_blank())
+p.Rod = list.boxplots$Rod 
+p.Amacrine = list.boxplots$Amacrine_Cells + theme(axis.title.y=element_blank())
+p.Horizontal = list.boxplots$Horizontal_Cells 
+p.deconv = p.RGC + p.Unknown + p.Rod + p.Amacrine + p.Horizontal +
+  plot_layout(ncol=2)
+ggsave(p.deconv, filename='./figures/fig.boxDeconv.pdf',
+       width=100, height=130, units='mm')
+
+```
+
