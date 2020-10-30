@@ -1,0 +1,13 @@
+Pathway,disease_group,sample_site,Set Size,BH adjusted p-value
+cAMP signaling pathway,NPDR/PDR + DME,Macula,146,1.72e-02
+Complement and coagulation cascades,NPDR/PDR + DME,Macula,35,6.16e-05
+Complement and coagulation cascades,NPDR/PDR + DME,Periphery,35,1.37e-02
+Cytokine-cytokine receptor interaction,Diabetic,Periphery,83,4.08e-02
+Cytokine-cytokine receptor interaction,NPDR/PDR + DME,Macula,83,4.21e-02
+ECM-receptor interaction,Diabetic,Macula,60,8.13e-03
+Hematopoietic cell lineage,Diabetic,Macula,25,1.64e-02
+Neuroactive ligand-receptor interaction,Diabetic,Macula,121,6.97e-03
+Neuroactive ligand-receptor interaction,Diabetic,Periphery,121,2.63e-03
+Neuroactive ligand-receptor interaction,NPDR/PDR + DME,Macula,121,5.24e-03
+Neuroactive ligand-receptor interaction,NPDR,Periphery,121,2.91e-03
+Protein digestion and absorption,NPDR/PDR + DME,Macula,47,1.12e-02
