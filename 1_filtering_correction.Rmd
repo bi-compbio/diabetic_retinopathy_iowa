@@ -1,0 +1,526 @@
+---
+title: "Data Filtering and Correction"
+author: "Kolja"
+date: 
+output: 
+---
+
+```{r, setup, include=FALSE}
+
+library(sva)
+library(pcaMethods)
+library(ggplot2)
+library(mclust)
+library(tidyr)
+library(plyr)
+library(dplyr)
+library(data.table)
+
+source('funcs.R')
+
+```
+
+## mRNA
+
+## Load and prepare mRNA data
+
+
+```{r, sample table for manuscript}
+
+# load metadata
+iowa.metadata = fread('./data/TableS1.csv') %>%
+  data.frame %>%
+  magrittr::set_rownames(.$sampleID)
+
+```
+
+```{r, load and prepare mRNA data}
+
+### EXPRESSION DATA
+iowa.counts.mRNA = fread('./data/human_retina_DR_totalRNA_counts.txt') %>%
+  data.frame %>%
+  tibble::column_to_rownames('ensemblID')
+
+# get raw counts from exprMatrix (also possible to get cpm and normCounts)
+iowa.DGE = edgeR::DGEList(counts=iowa.counts.mRNA)
+
+# order columns according to metadata
+iowa.DGE = iowa.DGE[, rownames(iowa.metadata)]
+
+```
+
+```{r, normalization and filtering}
+
+# get normalization factors
+iowa.DGE = calcNormFactors(iowa.DGE)
+
+# experiment design
+iowa.design = model.matrix(~0 + sample_group, data=iowa.metadata)
+colnames(iowa.design) = gsub('sample_group', '', colnames(iowa.design))
+
+# convert to voom normalized expression (cpm)
+iowa.voom = limma::voom(iowa.DGE, design=iowa.design, plot=FALSE)
+
+```
+
+## Analysis of technical replicates (mRNA only)
+
+As mentioned above a subset of samples indeed represents technical replicates. These are annotated
+
+
+```{r, check for correlation between tech reps}
+
+# experiment specific label for technical replicates 
+tech1 = c('sample_76', 'sample_66', 'sample_63', 'sample_80', 'sample_70', 'sample_74', 'sample_35') 
+tech2 = c('sample_75', 'sample_65', 'sample_64', 'sample_79', 'sample_69', 'sample_71', 'sample_39')
+
+# annotate technical replicates
+iowa.metadata$paired = rep('other', dim(iowa.metadata)[1])
+for (i in 1:7){
+  iowa.metadata[c(tech1[i], tech2[i]), 'paired'] = paste0('T', i)}
+
+# get most variable genes
+top.variable.genes = 
+  names(sort(apply(iowa.DGE$counts, 1, var), decreasing = TRUE))
+
+# get correlation
+iowa.correlation = cor(iowa.voom$E[top.variable.genes[1:100], ])
+
+# plot correlation heatmap
+ac = list(paired = as.character(
+  c('white', lapply(1:7, function(x) 
+    RColorBrewer::brewer.pal(7, 'Accent')[x]))))
+names(ac$paired) = c('other', paste0('T', 1:7))
+
+plot.hmCorr = pheatmap::pheatmap(iowa.correlation,
+  annotation_col = iowa.metadata[, c('paired', 'donor', 'eye', 'sample_site')],
+  annotation_row = iowa.metadata[, 'paired', drop=F],
+  annotation_colors = ac,
+  show_rownames = FALSE,
+  show_colnames = FALSE,
+  treeheight_row = 0,
+  annotation_names_row = FALSE,
+  treeheight_col = 20,
+  clustering_distance_rows = "correlation",
+  clustering_distance_cols = "correlation",
+  border_color=NA,
+  fontsize=6)
+
+```
+
+
+```{r, drop tech reps}
+
+# drop technical replicates which show high correlation
+samples.drop = c('sample_75', 'sample_65', 'sample_79')
+iowa.metadata = iowa.metadata[!(rownames(iowa.metadata) %in% samples.drop), ]
+iowa.DGE = iowa.DGE[, rownames(iowa.metadata)]
+
+# recalculate normalization
+iowa.DGE = calcNormFactors(iowa.DGE)
+iowa.design = model.matrix(~0 + sample_group, data=iowa.metadata)
+colnames(iowa.design) = gsub('sample_group', '', colnames(iowa.design))
+iowa.voom = voom(iowa.DGE, design=iowa.design, plot=FALSE)
+
+```
+
+
+## Removing non/lowly expressed genes
+
+
+```{r, remove non-expressed genes based on counts and GMM}
+
+# remove lowly expressed genes using edgeR
+genes.expressed = filterByExpr(iowa.DGE, group=iowa.metadata$sample_group)
+iowa.voom$E = iowa.voom$E[genes.expressed, ]
+
+# fit gaussian mixture model to average gene expression
+set.seed(1)
+GMM = Mclust(rowMeans(iowa.voom$E), G = 2)
+
+# GMM distributions for plot
+x = seq(min(rowMeans(iowa.voom$E)), max(rowMeans(iowa.voom$E)), length.out=101)
+df.gmm = rbind(
+  data.table(
+    x = x,
+    group = 'lowly expressed',
+    y = 
+      dnorm(
+        x, 
+        mean = GMM$parameters$mean[1], 
+        sd = sqrt(GMM$parameters$variance$sigmasq[1])) *
+      GMM$parameters$pro[1]),
+  data.table(
+    x = x,
+    group = 'expressed',
+    y = dnorm(
+      x, 
+      mean = GMM$parameters$mean[2], 
+      sd = sqrt(GMM$parameters$variance$sigmasq[2])) *
+      GMM$parameters$pro[2]))
+
+# plot count density
+p.gmm = ggplot(data.table(rowMeans(iowa.voom$E)), aes(x=V1)) +
+  geom_histogram(bins=100, aes(y=..density..)) +
+  geom_ribbon(data=df.gmm, aes(x=x, ymin=0, ymax=y, fill=group), alpha=0.5, color=NA) +
+  labs(x = 'Counts Per Million [log2]', y='Density') +
+  theme(
+    legend.title=element_blank(),
+    text=element_text(size=6),
+    legend.position='top', 
+    legend.key.size=unit(0.5,"line"))
+ggsave(plot=p.gmm, filename='./figures/fig.GMM.pdf',
+       height=40, width=70, units='mm')
+
+# use only genes in class 2
+genes.expressed = names(which(GMM$classification == 2))
+iowa.voom = iowa.voom[genes.expressed,]
+
+```
+
+## Correct for technical confounder and Age
+
+```{r, sva to correct for confounder - 1 variable}
+
+# Assign values for unknown batch effect via SVA (1 variable)
+mod0 = model.matrix(~1, data = iowa.metadata)
+mod1 = model.matrix(~sample_group, data = iowa.metadata)
+df.sv  = sva::sva(dat = iowa.voom$E,
+  mod = mod1,
+  mod0 = mod0,
+  n.sv = 1,
+  B = 10) %>%
+  .$sv %>% 
+  data.table %>% 
+  rename(sv = V1) %>% 
+  mutate(sampleID = colnames(iowa.voom$E)) %>%
+  merge(iowa.metadata, by='sampleID')
+
+# correct
+tmp = df.sv %>% 
+  dplyr::select(sv, age, sampleID) %>%
+  tibble::column_to_rownames('sampleID')
+iowa.corrected = t(compensate.confounders(
+  t(iowa.voom$E), 
+  confounders=tmp[colnames(iowa.voom), ], 
+  parallel=FALSE, 
+  offset2zero=TRUE)) %>%
+  data.frame  %>%
+  magrittr::set_colnames(colnames(iowa.DGE))
+
+```
+
+```{r, sva to correct for confounder - 2 variables}
+
+# Assign values for unknown batch effect via SVA
+df.sv2var  = sva::sva(dat = iowa.voom$E,
+  mod = mod1,
+  mod0 = mod0,
+  n.sv = 2,
+  B = 10) %>%
+  .$sv %>% 
+  data.table %>% 
+  rename(sv1 = V1, sv2 = V2) %>% 
+  mutate(sampleID = colnames(iowa.voom$E)) %>%
+  merge(iowa.metadata, by='sampleID')
+
+# correct
+tmp.sv2var = df.sv2var %>% 
+  dplyr::select(sv1, sv2, age, sampleID) %>%
+  tibble::column_to_rownames('sampleID')
+iowa.corrected.sv2var = t(compensate.confounders(
+  t(iowa.voom$E), 
+  confounders=tmp.sv2var, 
+  parallel=FALSE, 
+  offset2zero=TRUE)) %>%
+  data.frame %>%
+  magrittr::set_colnames(colnames(iowa.DGE))
+
+```
+
+```{r, pca and correlation with QC metrics before sv}
+
+# data
+list.data = list(
+  sv0 = iowa.voom$E,
+  sv1 = iowa.corrected,
+  sv2 = iowa.corrected.sv2var)
+
+# pca
+list.pca = lapply(list.data, function(x){
+  top = names(sort(apply(t(x), 2, var), decreasing = TRUE))
+  pca(
+    object = t(x[top,]),
+    scale  = "uv",  
+    cv     = "q2",   
+    nPcs   = 10)})
+
+```
+
+```{r, Q2 values for each model}
+
+# get Q2 values
+list.q2 = lapply(list.pca, function(x)
+  sapply(1:10, function(dummy) Q2(x)) %>% 
+    data.frame %>% 
+    mutate(PC = rownames(.)))
+
+# Q2 plot
+df.q2 = melt(
+  bind_rows(list.q2, .id='sv'), 
+  value.name='Q2', id.vars=c('PC', 'sv')) %>%
+  mutate(PC = factor(PC, levels=paste0('PC ', 1:10))) %>%
+  mutate(nSV = substr(sv, 3, 3))
+plot.q2 = ggplot(df.q2) +
+  aes(x=PC, y=Q2, fill=nSV) +
+  geom_boxplot(outlier.size=0.5) +
+  labs(y=bquote(Q^2~'-Values')) +
+  theme(
+    text=element_text(size=6),
+    axis.title.x=element_blank(),
+    legend.position='top', 
+    legend.key.size=unit(0.5,"line"))
+
+ggsave(plot=plot.q2, filename='./figures/fig.Q2.pdf',
+       width=70, height=50, units='mm')
+
+```
+
+```{r, plot correlation pc with QC metrics}
+
+# QC metrics
+df.qc = fread('./data/QCmetrics.txt') %>%
+  dplyr::select(
+    c('Sample', names(which(apply(., 2, var) != 0)))) 
+
+# scores uncorrected data
+scores.1 =  list.pca$sv0 %>%
+  scores %>%
+  data.frame %>%
+  tibble::rownames_to_column('sampleID') %>%
+  merge(iowa.metadata, by='sampleID') %>%
+  merge(df.qc, by.x='cgetID', by.y='Sample') %>%
+  dplyr::select(PC1, PC2, PC3, colnames(df.qc)[2:ncol(df.qc)], age)
+
+# scores corrected data 1 sv
+scores.2 = list.pca$sv1 %>%
+  scores %>%
+  data.frame %>%
+  tibble::rownames_to_column('sampleID') %>%
+  merge(iowa.metadata, by='sampleID') %>%
+  merge(df.qc, by.x='cgetID', by.y='Sample') %>%
+  dplyr::select(PC1, PC2, PC3, colnames(df.qc)[2:ncol(df.qc)])
+
+plot.scores.1 = scores.1 %>%
+  cor %>%
+  abs %>%
+  data.frame %>%
+  tibble::rownames_to_column('feature') %>%
+  dplyr::select(feature, PC1, PC2, PC3) %>%
+  melt(value.name='correlation') %>%
+  filter(!feature %in% c('PC1', 'PC2', 'PC3')) %>%
+  filter(!is.na(correlation)) %>%
+  data.table %>%
+  mutate(
+    feature = factor(
+      feature, levels = .[variable == 'PC2'][order(correlation)]$feature)) %>%
+  data.table
+
+plot.scores.2 = scores.2 %>%
+  cor %>%
+  abs %>%
+  data.frame %>%
+  tibble::rownames_to_column('feature') %>%
+  dplyr::select(feature, PC1, PC2, PC3) %>%
+  melt(value.name='correlation') %>%
+  filter(!feature %in% c('PC1', 'PC2', 'PC3')) %>%
+  filter(!is.na(correlation)) %>%
+  data.table %>%
+  mutate(
+    feature = factor(
+      feature, levels = plot.scores.1[variable == 'PC2'][order(correlation)]$feature))
+
+p1 = ggplot(plot.scores.1, aes(y=correlation, x=feature, fill=variable)) +
+  geom_bar(stat='identity', position='dodge') +
+  coord_flip() +
+  ylim(0, 1) +
+  labs(title='Before Correction', y='Pearson correlation [abs]') +
+  theme(
+    axis.title.y=element_blank(),
+    plot.title=element_text(size=6, hjust=0.5),
+    legend.position='none',
+    text=element_text(size=6))
+
+p2 = ggplot(plot.scores.2, aes(y=correlation, x=feature, fill=variable)) +
+  geom_bar(stat='identity', position='dodge') +
+  coord_flip() +
+  ylim(0, 1) +
+  labs(title='After Correction (1 sv)', y='Pearson correlation [abs]') +
+  theme(
+    axis.text.y=element_blank(),
+    axis.title.y=element_blank(),
+    plot.title=element_text(size=6, hjust=0.5),
+    legend.title=element_blank(),
+    text=element_text(size=6),
+    legend.key.size=unit(0.5,"line"))
+
+plot.pcCor = p1 + p2
+
+ggsave(plot.pcCor, filename='./figures/fig.pcCorr.pdf',
+       width=125, height=120, units='mm')
+
+```
+
+
+## miRNA data
+
+
+```{r, miRNA data}
+
+# FIXME: this should start from counts
+
+# load miRNA data
+iowa.miRNA.raw = fread('./data/cpm_miRNA.txt') %>%
+  data.frame %>%
+  magrittr::set_colnames(gsub('X', '', colnames(.))) %>%
+  tibble::column_to_rownames('mirbaseID')
+
+# filter non-active miRNA (RPM < 100)
+thres.miRNA = 100
+miRNA.active = 
+  rownames(iowa.miRNA.raw)[apply(iowa.miRNA.raw > log2(thres.miRNA), 1, any)]
+
+# filter, remove samples not in mRNA, align columns of mRNA and miRNA
+# FIXME: filtering should be done after removal of columns
+iowa.miRNA = iowa.miRNA.raw[miRNA.active, colnames(iowa.corrected)]
+
+# plot histogram with threshold
+plot.histMIRNA = ggplot(rowMeans(iowa.miRNA) %>% 
+    data.table %>% 
+    magrittr::set_names('meanCPM')) +
+  aes(x=meanCPM) +
+  geom_histogram(bins=sqrt(nrow(iowa.miRNA)), alpha=0.5) +
+  geom_vline(xintercept=log2(thres.miRNA), linetype='dashed') +
+  labs(x='Counts Per Million [log2]', y='Count') +
+  theme(
+    text=element_text(size=6))
+
+ggsave(plot=plot.histMIRNA, file='./figures/fig.histMIRNA.pdf',
+       height=40, width=70, units='mm')
+
+
+```
+
+```{r, age correction miRNA}
+
+# correct
+iowa.miRNA.corrected = t(compensate.confounders(t(iowa.miRNA), 
+  confounders=iowa.metadata[, c('age')], 
+  parallel=FALSE, 
+  offset2zero=TRUE)) %>%
+  data.frame %>%
+  magrittr::set_colnames(colnames(iowa.miRNA))
+
+```
+
+## PCA mRNA + miRNA
+
+```{r, plot PCA on corrected and combined data}
+
+# concat mRNA and miRNA data
+iowa.full = rbind(iowa.corrected, iowa.miRNA.corrected)
+
+# list of sampe for each pca
+list.samples = list(
+  full = rownames(iowa.metadata),
+  macula = rownames(iowa.metadata[iowa.metadata$sample_site == 'Macula', ]),
+  periphery = rownames(iowa.metadata[iowa.metadata$sample_site == 'Periphery', ]))
+
+# PCA
+n = 100
+list.pca = lapply(list.samples, function(x){
+  genes.sorted = names(sort(apply(iowa.full[, x], 1, var), decreasing = TRUE))
+  pca(
+    object = t(iowa.full[genes.sorted[1:n], x]),
+    scale  = "uv",  
+    cv     = "q2",   
+    nPcs   = 10)})
+
+# R2 values
+list.r2 = lapply(list.pca, function(x)
+  x %>%
+    R2cum %>%
+    .[[2]] %>% 
+    format(digits=2))
+
+# scores
+list.scores = lapply(list.pca, function(x)
+  x %>%
+    scores %>%
+    data.frame %>%
+    tibble::rownames_to_column('sampleID') %>%
+     merge(iowa.metadata, by='sampleID'))
+
+# position of label
+list.labels = list(
+  full = c(x=14, y=6.5),
+  macula = c(x=7, y=8.5),
+  periphery = c(x=8.5, y=12.5))
+
+# pca plots
+list.plots = lapply(names(list.scores), function(x)
+  ggplot(list.scores[[x]]) +
+    aes(x = PC1, y = PC2, colour=sample_site, shape=disease_group_detailed) + 
+    geom_point() +
+    annotate('text', x=list.labels[[x]][[1]], y=list.labels[[x]][[2]], parse=T,
+      label=paste('R^2==', list.r2[[x]]), size=2, vjust=1) +
+    scale_color_manual(name = 'Sample Site',
+      values = c(Macula='#ed7d31', Periphery='#5b9bd5')) +
+    scale_shape_manual(
+      name = 'Disease Group', values = c(1, 0, 2, 17, 18)) +
+    theme(
+      legend.box = 'horizontal',
+      legend.text=element_text(size=6),
+      legend.title=element_text(size=6))) %>%
+  magrittr::set_names(names(list.scores))
+
+# pca plot theme
+theme_pca = function(){ 
+  theme_minimal(base_size=6) %+replace% 
+  theme(
+    legend.position = 'none')}
+
+# get legend and clean plots
+pca.legend = get_legend(list.plots$full)
+list.plots = lapply(list.plots, function(x)
+  x + theme_pca())
+
+# combine plots
+fig.pca = plot_grid(
+  list.plots$full, list.plots$macula, 
+  list.plots$periphery, pca.legend,
+  ncol=2, nrow=2)
+
+ggsave(plot=fig.pca, filename='./figures/fig.pca.pdf',
+       width=170, height=100, units='mm')
+
+```
+## save
+
+```{r, save results}
+
+# save
+fwrite(iowa.corrected  %>%
+  tibble::rownames_to_column('ensemblID'), 
+  file = './data/human_retina_DR_totalRNA_normalized_cpm.txt')
+fwrite(iowa.miRNA.corrected  %>%
+  tibble::rownames_to_column('ensemblID'),
+  file = './data/human_retina_DR_smallRNA_normalized_cpm.txt')
+fwrite(iowa.full %>%
+  tibble::rownames_to_column('ensemblID'),
+  file = './data/human_retina_DR_combined_normalized_cpm.txt')
+
+```
+
+
+
