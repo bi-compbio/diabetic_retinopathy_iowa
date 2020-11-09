@@ -2,9 +2,13 @@
 
 This is a joint project between the Department of Ophthalmology &amp; Visual Sciences at the University of Iowa (Markus Kuehn), and the Department of Cardiometabolic Research as well as global Computational Biology and Digital Sciences at Boehringer Ingelheim.
 
-This code has been last run on R version 4.0.2 (2020-06-22) and OS x86_64, linux-gnu.
+How to: Ideally R code should be run according to the prefix numbers. This will generate intermediate files (+ figures) used for subsequent analysis. All intermediate files have been generated for reference.
+
+***
 
 package environment:
+
+R version 4.0.2 (2020-06-22) on OS x86_64, linux-gnu.
 
 limma (version 3.44.3) - 
 edgeR (version 3.30.3) - 
